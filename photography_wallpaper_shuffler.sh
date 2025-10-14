@@ -39,6 +39,9 @@ LOCK_SLEEP_INITIAL=10      # initial wait
 LOCK_SLEEP_MAX=600         # maximum wait (10 minutes)
 LOCK_SLEEP_CURRENT=$LOCK_SLEEP_INITIAL
 
+# Whether to pause switching while the screen is locked (env override supported)
+PAUSE_WHEN_LOCKED="${PAUSE_WHEN_LOCKED:-true}"
+
 # File list cache / refresh tuning (optimize for thousands of images)
 REFRESH_SECONDS=10800        # Re-scan directory tree at most every 3 hours (unless list exhausted)
 FILES=()                     # Cached shuffled list
@@ -178,8 +181,40 @@ trap cleanup_and_exit EXIT TERM
 ERRORCOUNT=0
 
 is_screen_locked() {
-    # check GNOME status of lock
-    loginctl show-session $(loginctl | awk '/tty/ {print $1; exit}') -p Locked | grep -q 'yes'
+    # Return 0 (true) if the session is locked, else 1 (false)
+    # Multiple strategies: GNOME ScreenSaver DBus -> freedesktop ScreenSaver -> loginctl
+    [ "${PAUSE_WHEN_LOCKED:-true}" = true ] || return 1
+
+    # Prefer gdbus queries (fast and reliable on GNOME)
+    if command -v gdbus >/dev/null 2>&1; then
+        # org.gnome.ScreenSaver
+        if gdbus call --session \
+            --dest org.gnome.ScreenSaver \
+            --object-path /org/gnome/ScreenSaver \
+            --method org.gnome.ScreenSaver.GetActive 2>/dev/null | grep -q 'true'; then
+            return 0
+        fi
+        # org.freedesktop.ScreenSaver
+        if gdbus call --session \
+            --dest org.freedesktop.ScreenSaver \
+            --object-path /org/freedesktop/ScreenSaver \
+            --method org.freedesktop.ScreenSaver.GetActive 2>/dev/null | grep -q 'true'; then
+            return 0
+        fi
+    fi
+
+    # Fallback to loginctl Locked property
+    if command -v loginctl >/dev/null 2>&1; then
+        # Prefer current session id if available, else try common active entries
+        session_id="${XDG_SESSION_ID:-$(loginctl | awk '/(seat0|tty)/ {print $1; exit}') }"
+        if [ -n "$session_id" ]; then
+            if loginctl show-session "$session_id" -p Locked 2>/dev/null | grep -q '=yes'; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
 }
 
 # --- Count helper functions supporting paths with spaces ---
@@ -252,7 +287,7 @@ while true; do
         fi
     fi
 
-    # If screen locked, handle exponential backoff before doing any heavy work
+    # If screen locked, optionally pause switching with exponential backoff
     if is_screen_locked; then
         echo "[info] $(date '+%F %T') - Screen locked, waiting ${LOCK_SLEEP_CURRENT}s (exp backoff)."
         sleep "$LOCK_SLEEP_CURRENT"
