@@ -1,7 +1,6 @@
 # Python virtual environments
 .venv/
 venv/
-
 downloads/
 .vscode/
 docs/
