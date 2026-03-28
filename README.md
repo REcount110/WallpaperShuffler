@@ -11,7 +11,7 @@ nohup bash photography_wallpaper_shuffler_v2.sh &
 
 
 v2 核心改进：
-- **文件名内嵌计数** `photo{2}.jpg` — 无外部状态文件，O(1) 读写
+- **SQLite DB 计数存储** — 跨重启持久化，文件名保持原始形态，O(1) SQL UPDATE
 - **磁盘播放列表** — 10万图片内存占用 ~0（vs v1 ~20MB）
 - **修复 should_refresh_list 逻辑反转 bug** — v1 每迭代都全量 find
 - **find -maxdepth 20** — 防符号链接循环
