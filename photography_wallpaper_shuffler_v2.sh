@@ -1,8 +1,9 @@
 #!/bin/bash
 
 #*********************************************************************************************************
-# Photography wallpaper random shuffle script v2.0
+# Photography wallpaper random shuffle script v2.3
 # — Refactored for 100k+ images with O(1) per-iteration cost.
+# — v2.3: true O(1) cmd_next, batched scan for 500k+, file size filter.
 #
 # Key changes from v1:
 #   1. SQLite-backed image index (playlist_index.py) replaces external COUNT_FILE
@@ -33,7 +34,7 @@
 set -o pipefail
 
 # ========== Configuration ==========
-INTERVAL=${INTERVAL:-1}                       # minutes between wallpaper changes
+INTERVAL=${INTERVAL:-2}                       # minutes between wallpaper changes
 FOLDER="${FOLDER:-/home/${USER}/myWallPaper/}" # primary image folder (trailing slash)
 FOLDER="${FOLDER%/}/"                          # ensure trailing slash
 
@@ -67,6 +68,11 @@ PLAYLIST_LAST_REBUILD=0
 # Find options
 FOLLOW_SYMLINKS=${FOLLOW_SYMLINKS:-true}
 FIND_MAX_DEPTH=${FIND_MAX_DEPTH:-20}            # prevent symlink loop infinite recursion
+
+# File size filter (bytes).  Files larger than this are skipped during scan.
+# 0 = no limit.  Set to filter out RAW files that cause GNOME OOM on decode.
+# Recommended: 31457280 (30 MB) for mixed RAW+JPEG libraries.
+MAX_FILE_SIZE=${MAX_FILE_SIZE:-0}
 
 # Fallback switching
 FALLBACK_SWITCH_COOLDOWN=${FALLBACK_SWITCH_COOLDOWN:-60}
@@ -202,7 +208,9 @@ build_playlist() {
     log info "Index scan (incremental): $workdir"
     if _py_index scan "$workdir" \
             --max-depth "$FIND_MAX_DEPTH" \
-            $([ "$FOLLOW_SYMLINKS" != true ] && echo '--no-follow-symlinks') 2>&1 | while IFS= read -r line; do log info "  $line"; done; then
+            $([ "$FOLLOW_SYMLINKS" != true ] && echo '--no-follow-symlinks') \
+            $([ "$MAX_FILE_SIZE" -gt 0 ] 2>/dev/null && echo "--max-file-size $MAX_FILE_SIZE") \
+            2>&1 | while IFS= read -r line; do log info "  $line"; done; then
         PLAYLIST_LAST_REBUILD=$(date +%s)
         return 0
     fi
@@ -216,7 +224,9 @@ rebuild_playlist() {
     log info "Index rebuild (full): $workdir"
     _py_index rebuild "$workdir" \
         --max-depth "$FIND_MAX_DEPTH" \
-        $([ "$FOLLOW_SYMLINKS" != true ] && echo '--no-follow-symlinks') 2>&1 | while IFS= read -r line; do log info "  $line"; done
+        $([ "$FOLLOW_SYMLINKS" != true ] && echo '--no-follow-symlinks') \
+        $([ "$MAX_FILE_SIZE" -gt 0 ] 2>/dev/null && echo "--max-file-size $MAX_FILE_SIZE") \
+        2>&1 | while IFS= read -r line; do log info "  $line"; done
     PLAYLIST_LAST_REBUILD=$(date +%s)
 }
 
@@ -391,7 +401,8 @@ reload_config() {
                 FOLLOW_SYMLINKS|FIND_MAX_DEPTH|PLAYLIST_REBUILD_INTERVAL|\
                 EMPTY_BACKOFF_INITIAL|EMPTY_BACKOFF_MAX|LOG_LEVEL|ERROR_THRESHOLD|\
                 OOM_GNOME_RSS_MAX_KB|OOM_PAUSE_SECONDS|\
-                LOCK_POLL_INTERVAL|PLAYLIST_INDEX_DB|PLAYLIST_INDEX_PY)
+                LOCK_POLL_INTERVAL|PLAYLIST_INDEX_DB|PLAYLIST_INDEX_PY|\
+                MAX_FILE_SIZE)
                     declare -g "$key=$val"
                     log info "  $key=$val"
                     ;;

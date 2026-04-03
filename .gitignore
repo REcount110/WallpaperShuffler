@@ -5,3 +5,5 @@ downloads/
 .vscode/
 docs/
 spider/
+__pycache__/
+*.pyc
