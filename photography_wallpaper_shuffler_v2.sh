@@ -27,7 +27,7 @@
 # Requirements: gsettings, find, readlink, flock, python3 (stdlib sqlite3)
 # Designed for GNOME desktop environment (Wayland & X11).
 # 
-# Date: 2024-06-27 / Refactored: 2026-03-28
+# Date: 2024-06-27
 # Author: Rackell
 #*********************************************************************************************************
 
@@ -35,7 +35,7 @@ set -o pipefail
 
 # ========== Configuration ==========
 INTERVAL=${INTERVAL:-2}                       # minutes between wallpaper changes
-FOLDER="${FOLDER:-/home/${USER}/myWallPaper/}" # primary image folder (trailing slash)
+FOLDER="${FOLDER:-/media/rackell/C519-AB28/}" # primary image folder (trailing slash)
 FOLDER="${FOLDER%/}/"                          # ensure trailing slash
 
 FALLBACK_DIRS=(/usr/share/backgrounds /usr/share/pixmaps)
@@ -94,10 +94,10 @@ ERRORCOUNT=0
 ERROR_THRESHOLD=${ERROR_THRESHOLD:-20}          # cumulative errors × INTERVAL before exit
 
 # Concurrency lock
-GLOBAL_LOCK_FILE="${HOME}/myShell/.wallpaper_shuffle_v2.lock"
+GLOBAL_LOCK_FILE="${HOME}/myShell/wallpaperShuffer/.wallpaper_shuffle_v2.lock"
 
 # Config file for HUP reload
-CONFIG_FILE="${HOME}/myShell/.wallpaper_shuffle_v2.conf"
+CONFIG_FILE="${HOME}/myShell/wallpaperShuffer/.wallpaper_shuffle_v2.conf"
 
 # Logging
 LOG_LEVEL=${LOG_LEVEL:-info}                    # debug|info|warn|error
@@ -179,8 +179,22 @@ _find_cmd() {
 has_images() {
     local d="$1"
     [ -d "$d" ] || return 1
-    # falsely indicating no images exist.
-    { _find_cmd "$d" || true; } | head -1 | grep -q .
+    # Use timeout to prevent hanging on stale/disconnected mounts.
+    # 10s is generous; local filesystems respond in <1s.
+    local follow_flag=""
+    [ "$FOLLOW_SYMLINKS" = true ] && follow_flag="-L"
+    local result
+    if command -v timeout >/dev/null 2>&1; then
+        result=$(timeout 10 find $follow_flag "$d" -maxdepth "$FIND_MAX_DEPTH" \
+            -path "${RECYCLE_DIR}" -prune -o \
+            -type f \
+            \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
+               -o -iname '*.gif' -o -iname '*.tga' -o -iname '*.webp' -o -iname '*.bmp' \) \
+            -print -quit 2>/dev/null) || true
+    else
+        result=$({ _find_cmd "$d" || true; } | head -1)
+    fi
+    [ -n "$result" ]
 }
 
 pick_fallback_dir() {
@@ -192,6 +206,115 @@ pick_fallback_dir() {
         fi
     done
     return 1
+}
+
+# ========== Drive Mount Helper ==========
+# Check if FOLDER is on an actually mounted filesystem.
+# A leftover empty mount-point directory does NOT count as "mounted".
+is_drive_mounted() {
+    [ -d "$FOLDER" ] || return 1
+    local folder_norm="${FOLDER%/}"
+    # mountpoint command is the most reliable check
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$folder_norm" 2>/dev/null && return 0
+        return 1
+    fi
+    # Fallback: check /proc/mounts (strip trailing slash for match)
+    grep -qs " ${folder_norm} " /proc/mounts 2>/dev/null
+}
+
+# Locate the block device for the external drive.
+# The folder name may be a filesystem LABEL or a UUID (common for exFAT/FAT32).
+# Tries: by-label, by-uuid, lsblk label scan, lsblk uuid scan, blkid.
+_find_drive_device() {
+    local ident
+    ident="$(basename "${FOLDER%/}")"
+    [ -z "$ident" ] && return 1
+
+    local dev
+
+    # 1. /dev/disk/by-label/<ident> (exact match)
+    dev="/dev/disk/by-label/$ident"
+    if [ -e "$dev" ]; then
+        echo "$dev"
+        return 0
+    fi
+
+    # 2. /dev/disk/by-uuid/<ident> (exFAT/FAT32 mount points often use UUID as name)
+    dev="/dev/disk/by-uuid/$ident"
+    if [ -e "$dev" ]; then
+        echo "$dev"
+        return 0
+    fi
+
+    # 3. lsblk scan by label (case-insensitive for FAT32)
+    if command -v lsblk >/dev/null 2>&1; then
+        dev=$(lsblk -rno NAME,LABEL 2>/dev/null \
+              | awk -v id="$ident" 'toupper($2)==toupper(id) {print "/dev/"$1; exit}')
+        if [ -n "$dev" ] && [ -e "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+        # 4. lsblk scan by UUID
+        dev=$(lsblk -rno NAME,UUID 2>/dev/null \
+              | awk -v id="$ident" 'toupper($2)==toupper(id) {print "/dev/"$1; exit}')
+        if [ -n "$dev" ] && [ -e "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+    fi
+
+    # 5. blkid by label
+    if command -v blkid >/dev/null 2>&1; then
+        dev=$(blkid -L "$ident" 2>/dev/null)
+        if [ -n "$dev" ] && [ -e "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+        # 6. blkid by UUID
+        dev=$(blkid -U "$ident" 2>/dev/null)
+        if [ -n "$dev" ] && [ -e "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Attempt to mount the external drive containing FOLDER using udisksctl (no root).
+# The folder name (from FOLDER path) is used to locate the device by label or UUID.
+# E.g. FOLDER=/media/rackell/C519-AB28/ → identifies /dev/nvme0n1p1 (UUID=C519-AB28)
+try_mount_drive() {
+    # Check actual mount status, not just directory existence
+    is_drive_mounted && return 0
+
+    if ! command -v udisksctl >/dev/null 2>&1; then
+        log debug "udisksctl not available; cannot auto-mount drive"
+        return 1
+    fi
+
+    local dev
+    dev=$(_find_drive_device)
+    if [ -z "$dev" ]; then
+        log debug "Drive device not found (drive may be disconnected)"
+        return 1
+    fi
+
+    log info "Attempting to mount drive: $dev → $FOLDER"
+    local mount_output
+    if mount_output=$(udisksctl mount -b "$dev" 2>&1); then
+        log info "Drive mount: $mount_output"
+        # Verify the expected folder is now a real mount
+        if is_drive_mounted; then
+            return 0
+        fi
+        log warn "Drive mounted but $FOLDER is not the mount point (actual: $mount_output)"
+        return 1
+    else
+        log warn "udisksctl mount failed for $dev: $mount_output"
+        return 1
+    fi
 }
 
 # ========== SQLite Index Management ==========
@@ -448,6 +571,9 @@ fi
 ALLOW_DELETE=true
 CURRENT_DIR="$FOLDER"
 
+# Try to mount the external drive if not yet accessible
+try_mount_drive
+
 if [ -d "$FOLDER" ]; then
     if ! has_images "$FOLDER"; then
         fb="$(pick_fallback_dir || true)"
@@ -491,6 +617,8 @@ fi
 while true; do
 
     # --- Directory recovery/switch ---
+    # Try to mount the external drive if we are currently on fallback
+    [ "$ALLOW_DELETE" = false ] && try_mount_drive
     if [ "$ALLOW_DELETE" = false ] && has_images "$FOLDER"; then
         log info "Primary folder has images again, switching back to $FOLDER"
         CURRENT_DIR="$FOLDER"
@@ -498,15 +626,22 @@ while true; do
         build_playlist "$CURRENT_DIR"
     fi
     if [ "$ALLOW_DELETE" = true ] && ! has_images "$FOLDER"; then
-        fb="$(pick_fallback_dir || true)"
-        if [ -n "$fb" ]; then
-            now_ts=$(date +%s)
-            if [ $(( now_ts - LAST_FALLBACK_SWITCH )) -ge $FALLBACK_SWITCH_COOLDOWN ]; then
-                log info "Primary empty, switching to: $fb"
-                CURRENT_DIR="$fb"
-                ALLOW_DELETE=false
-                LAST_FALLBACK_SWITCH=$now_ts
-                build_playlist "$CURRENT_DIR"
+        # Drive disappeared while in primary mode (e.g. GNOME auto-unmount).
+        # Attempt remount before falling back to system wallpapers.
+        log warn "Primary folder inaccessible: $FOLDER — attempting remount"
+        if try_mount_drive && has_images "$FOLDER"; then
+            log info "Drive remounted, primary folder restored: $FOLDER"
+        else
+            fb="$(pick_fallback_dir || true)"
+            if [ -n "$fb" ]; then
+                now_ts=$(date +%s)
+                if [ $(( now_ts - LAST_FALLBACK_SWITCH )) -ge $FALLBACK_SWITCH_COOLDOWN ]; then
+                    log info "Primary empty, switching to: $fb"
+                    CURRENT_DIR="$fb"
+                    ALLOW_DELETE=false
+                    LAST_FALLBACK_SWITCH=$now_ts
+                    build_playlist "$CURRENT_DIR"
+                fi
             fi
         fi
     fi
