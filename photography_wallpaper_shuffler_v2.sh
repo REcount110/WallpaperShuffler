@@ -35,7 +35,7 @@ set -o pipefail
 
 # ========== Configuration ==========
 INTERVAL=${INTERVAL:-2}                       # minutes between wallpaper changes
-FOLDER="${FOLDER:-/media/rackell/C519-AB28/}" # primary image folder (trailing slash)
+FOLDER="${FOLDER:-/media/${USER}/C519-AB28/}" # primary image folder (trailing slash)
 FOLDER="${FOLDER%/}/"                          # ensure trailing slash
 
 FALLBACK_DIRS=(/usr/share/backgrounds /usr/share/pixmaps)
@@ -133,23 +133,27 @@ log() {
     echo "[$level] $ts - $*" >&2
 }
 
+# ========== Early Startup Logging ==========
+# Early startup logs before log() is fully ready (config may not be loaded yet)
+# These use direct echo since log() respects LOG_LEVEL which isn't applied until later
+
 # ========== Sanity Checks ==========
 if ! command -v gsettings >/dev/null 2>&1; then
-    echo "gsettings not found. This script requires GNOME settings." >&2
+    echo "[error] $(date '+%F %T') - gsettings not found. This script requires GNOME settings." >&2
     exit 1
 fi
 
 for cmd in find readlink flock python3; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "Required command not found: $cmd" >&2
+        echo "[error] $(date '+%F %T') - Required command not found: $cmd" >&2
         exit 1
     fi
 done
 
 # Verify playlist_index.py is accessible
 if [ ! -f "$PLAYLIST_INDEX_PY" ]; then
-    echo "playlist_index.py not found at: $PLAYLIST_INDEX_PY" >&2
-    echo "Set PLAYLIST_INDEX_PY to its full path and retry." >&2
+    echo "[error] $(date '+%F %T') - playlist_index.py not found at: $PLAYLIST_INDEX_PY" >&2
+    echo "[error] $(date '+%F %T') - Set PLAYLIST_INDEX_PY to its full path and retry." >&2
     exit 1
 fi
 
@@ -550,22 +554,27 @@ trap request_rebuild USR1
 trap reload_config HUP
 
 # ========== Startup ==========
-sleep 4    # wait for desktop environment
+echo "[info] $(date '+%F %T') - Waiting 4s for desktop environment..." >&2
+sleep 4
+echo "[info] $(date '+%F %T') - Desktop environment wait complete" >&2
 
 # Load config file at startup (same logic as HUP reload),
 # so persistent settings take effect without needing an explicit HUP signal.
+log debug "Loading config from: $CONFIG_FILE"
 reload_config
+log info "Config loaded (LOG_LEVEL=$LOG_LEVEL INTERVAL=$INTERVAL)"
 
 # Ensure index DB directory exists
-mkdir -p "$(dirname "$PLAYLIST_INDEX_DB")"
+mkdir -p "$(dirname "$PLAYLIST_INDEX_DB")" || { echo "[error] $(date '+%F %T') - Cannot create DB directory" >&2; exit 1; }
 
 # Concurrency lock
-mkdir -p "$(dirname "$GLOBAL_LOCK_FILE")"
-exec 200>"$GLOBAL_LOCK_FILE" || { echo "Cannot open lock file" >&2; exit 1; }
+mkdir -p "$(dirname "$GLOBAL_LOCK_FILE")" || { echo "[error] $(date '+%F %T') - Cannot create lock directory" >&2; exit 1; }
+exec 200>"$GLOBAL_LOCK_FILE" || { echo "[error] $(date '+%F %T') - Cannot open lock file" >&2; exit 1; }
 if ! flock -n 200; then
-    echo "Another instance running (lock: $GLOBAL_LOCK_FILE). Exiting." >&2
+    echo "[warn] $(date '+%F %T') - Another instance running (lock: $GLOBAL_LOCK_FILE). Exiting." >&2
     exit 0
 fi
+log info "Lock acquired, proceeding with startup"
 
 # Decide initial working directory
 ALLOW_DELETE=true
@@ -607,14 +616,21 @@ fi
 [ "$RECYCLE_MODE" = true ] && mkdir -p "$RECYCLE_DIR"
 
 # Build initial index (incremental scan; full rebuild if DB absent)
+log info "Building initial playlist index..."
 if [ ! -f "$PLAYLIST_INDEX_DB" ]; then
+    log info "DB does not exist, performing full rebuild"
     rebuild_playlist "$CURRENT_DIR"
 else
+    log debug "DB exists, performing incremental scan"
     build_playlist "$CURRENT_DIR"
 fi
+log info "Playlist index ready, entering main loop"
 
 # ========== Main Loop ==========
+ITERATION=0
 while true; do
+    ((ITERATION++))
+    log debug "=== Iteration $ITERATION start (DIR=$CURRENT_DIR) ==="
 
     # --- Directory recovery/switch ---
     # Try to mount the external drive if we are currently on fallback
@@ -676,6 +692,7 @@ while true; do
     #   • Atomically increments its count in the DB
     #   • Auto-resets all counts if the round is exhausted
     #   • Outputs path on line 1, new count on line 2
+    log debug "Querying next image from playlist..."
     photo=""
     local_newcount=0
     {
@@ -684,6 +701,7 @@ while true; do
     } < <(next_from_playlist) || true
 
     if [ -z "$photo" ]; then
+        log debug "Index returned empty, rebuilding playlist"
         # Index empty — try a fresh incremental scan first
         build_playlist "$CURRENT_DIR"
         {
@@ -691,19 +709,23 @@ while true; do
             IFS= read -r local_newcount
         } < <(next_from_playlist) || true
         if [ -z "$photo" ]; then
+            log warn "Still no images after rebuild, waiting for new files"
             wait_for_new_files "$CURRENT_DIR"
             continue
         fi
     fi
+    log debug "Got image from index: $(basename "$photo") (count=$local_newcount)"
 
     # Resolve to absolute path (handles any remaining symlinks)
+    log debug "Resolving symlinks for: $photo"
     photo=$(readlink -f "$photo" 2>/dev/null) || true
     if [ -z "$photo" ] || [ ! -f "$photo" ]; then
-        log debug "Skipping missing: $photo"
+        log warn "Image not accessible, marking inactive and continuing"
         # Deactivate in DB so it won't be picked again (guard: only if non-empty)
         [ -n "$photo" ] && _py_index mark-inactive "$photo" 2>/dev/null || true
         continue
     fi
+    log debug "Resolved path: $photo"
 
     # --- Schedule deferred recycle/delete if count has reached MAX_SHOW ---
     # Count is managed entirely by the SQLite DB (authoritative, persistent).
@@ -719,11 +741,17 @@ while true; do
     fi
 
     # --- Set wallpaper ---
+    log debug "Setting wallpaper: $photo"
     if gsettings set org.gnome.desktop.background picture-uri "file://$photo" 2>/dev/null; then
+        log info "Wallpaper set (light): $(basename "$photo") (count=$local_newcount, mode=$([[ "$ALLOW_DELETE" = true ]] && echo "primary" || echo "fallback"))"
         ERRORCOUNT=0
 
         if [ "$SUPPORTS_DARK" -eq 1 ]; then
-            gsettings set org.gnome.desktop.background picture-uri-dark "file://$photo" 2>/dev/null || true
+            if gsettings set org.gnome.desktop.background picture-uri-dark "file://$photo" 2>/dev/null; then
+                log debug "Wallpaper set (dark variant)"
+            else
+                log debug "Failed to set dark variant (non-fatal)"
+            fi
         fi
 
         # Reset empty backoff on success
@@ -736,20 +764,24 @@ while true; do
         fi
     else
         ((ERRORCOUNT++)) || true
-        log warn "gsettings failed for: $photo (errors=$ERRORCOUNT)"
+        log warn "gsettings failed for: $(basename "$photo") (errors=$ERRORCOUNT, threshold: $((ERRORCOUNT * INTERVAL)) vs $ERROR_THRESHOLD)"
         if [ $((ERRORCOUNT * INTERVAL)) -gt "$ERROR_THRESHOLD" ]; then
+            echo "[error] $(date '+%F %T') - Too many consecutive errors, exiting." >&2
             log error "Too many consecutive errors, exiting."
             cleanup_and_exit
         fi
     fi
 
     # --- Display interval ---
+    log debug "Sleeping for ${INTERVAL}m before next rotation..."
     sleep "${INTERVAL}m"
 
     # --- Deferred recycle/delete ---
     if [ "$DO_DELETE_AFTER_SLEEP" -eq 1 ] && [ -n "$DELETE_TARGET" ]; then
+        log debug "Deferred delete: reached MAX_SHOW=$MAX_SHOW, recycling/deleting..."
         recycle_or_delete "$DELETE_TARGET"
         # Keep DB in sync: the file is now in .recycle (or deleted), mark inactive.
         _py_index mark-inactive "$DELETE_TARGET" 2>/dev/null || true
     fi
+    log debug "=== Iteration $ITERATION complete ==="
 done
