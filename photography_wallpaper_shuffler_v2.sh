@@ -357,9 +357,32 @@ rebuild_playlist() {
     PLAYLIST_LAST_REBUILD=$(date +%s)
 }
 
-# Read next image path from the index. Returns 1 if nothing available.
+# Read next image path from the index (primary folder only). Returns 1 if nothing available.
 next_from_playlist() {
     _py_index next --max-show "$MAX_SHOW" --folder "$CURRENT_DIR"
+}
+
+# Pick a random image directly from a folder (used for system wallpapers).
+# This bypasses the index, so system wallpapers are never counted or deleted.
+pick_random_system_wallpaper() {
+    local folder="$1"
+    if ! has_images "$folder"; then
+        return 1
+    fi
+    local follow_flag=""
+    [ "$FOLLOW_SYMLINKS" = true ] && follow_flag="-L"
+    local photo
+    photo=$(find $follow_flag "$folder" -maxdepth "$FIND_MAX_DEPTH" \
+        -type f \
+        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
+           -o -iname '*.gif' -o -iname '*.tga' -o -iname '*.webp' -o -iname '*.bmp' \) \
+        -print | shuf -n 1)
+    if [ -n "$photo" ]; then
+        echo "$photo"
+        echo "0"  # count=0 (not tracked for system wallpapers)
+        return 0
+    fi
+    return 1
 }
 
 should_rebuild_playlist() {
@@ -615,16 +638,20 @@ fi
 # Ensure recycle dir exists if needed
 [ "$RECYCLE_MODE" = true ] && mkdir -p "$RECYCLE_DIR"
 
-# Build initial index (incremental scan; full rebuild if DB absent)
+# Build initial index (only for primary folder; system wallpapers are never indexed)
 log info "Building initial playlist index..."
-if [ ! -f "$PLAYLIST_INDEX_DB" ]; then
-    log info "DB does not exist, performing full rebuild"
-    rebuild_playlist "$CURRENT_DIR"
+if [ "$ALLOW_DELETE" = true ]; then
+    if [ ! -f "$PLAYLIST_INDEX_DB" ]; then
+        log info "DB does not exist, performing full rebuild"
+        rebuild_playlist "$CURRENT_DIR"
+    else
+        log debug "DB exists, performing incremental scan"
+        build_playlist "$CURRENT_DIR"
+    fi
+    log info "Playlist index ready, entering main loop"
 else
-    log debug "DB exists, performing incremental scan"
-    build_playlist "$CURRENT_DIR"
+    log info "Using system wallpapers (no indexing/counting/deletion)"
 fi
-log info "Playlist index ready, entering main loop"
 
 # ========== Main Loop ==========
 ITERATION=0
@@ -681,24 +708,27 @@ while true; do
         oom_throttle_off
     fi
 
-    # --- Scheduled incremental index re-scan ---
-    if should_rebuild_playlist; then
+    # --- Scheduled incremental index re-scan (primary folder only) ---
+    if [ "$ALLOW_DELETE" = true ] && should_rebuild_playlist; then
         build_playlist "$CURRENT_DIR"
     fi
 
-    # --- Pick next image from SQLite index ---
-    # next_from_playlist calls `playlist_index.py next` which:
-    #   • Picks a weighted-random active image with count < MAX_SHOW
-    #   • Atomically increments its count in the DB
-    #   • Auto-resets all counts if the round is exhausted
-    #   • Outputs path on line 1, new count on line 2
-    log debug "Querying next image from playlist..."
+    # --- Pick next image ---
+    # For primary folder: use SQLite index (weighted-random, counted)
+    # For system wallpapers: random selection only (never counted or deleted)
+    if [ "$ALLOW_DELETE" = true ]; then
+        # Primary folder: use database-backed selection
+        log debug "Querying next image from playlist..."
+    else
+        # System wallpapers: direct random selection, no indexing
+        log debug "Picking random system wallpaper..."
+    fi
     photo=""
     local_newcount=0
     {
         IFS= read -r photo
         IFS= read -r local_newcount
-    } < <(next_from_playlist) || true
+    } < <([ "$ALLOW_DELETE" = true ] && next_from_playlist || pick_random_system_wallpaper "$CURRENT_DIR") || true
 
     if [ -z "$photo" ]; then
         log debug "Index returned empty, rebuilding playlist"
@@ -728,8 +758,8 @@ while true; do
     log debug "Resolved path: $photo"
 
     # --- Schedule deferred recycle/delete if count has reached MAX_SHOW ---
+    # Only applies to primary folder images; system wallpapers are never deleted.
     # Count is managed entirely by the SQLite DB (authoritative, persistent).
-    # No file renaming needed; filenames remain unchanged throughout.
     DO_DELETE_AFTER_SLEEP=0
     DELETE_TARGET=""
     if [ "$ALLOW_DELETE" = true ] && [[ "$photo" == "$FOLDER"* ]]; then
@@ -760,16 +790,17 @@ while true; do
         if [ "$ALLOW_DELETE" = true ]; then
             log info "wallpaper: $photo (count=$local_newcount, mode=primary)"
         else
-            log info "wallpaper: $photo (mode=fallback)"
+            log info "wallpaper: $(basename "$photo") (mode=system, uncounted)"
         fi
     else
         ((ERRORCOUNT++)) || true
-        log warn "gsettings failed for: $(basename "$photo") (errors=$ERRORCOUNT, threshold: $((ERRORCOUNT * INTERVAL)) vs $ERROR_THRESHOLD)"
+        log info "gsettings failed for: $(basename "$photo") (errors=$ERRORCOUNT, threshold: $((ERRORCOUNT * INTERVAL)) vs $ERROR_THRESHOLD)"
         if [ $((ERRORCOUNT * INTERVAL)) -gt "$ERROR_THRESHOLD" ]; then
             echo "[error] $(date '+%F %T') - Too many consecutive errors, exiting." >&2
             log error "Too many consecutive errors, exiting."
             cleanup_and_exit
         fi
+        continue
     fi
 
     # --- Display interval ---
